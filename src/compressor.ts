@@ -51,7 +51,10 @@ export class ToolCompressor {
 
   constructor(tools: ToolEntry[], config?: ToolCompressorConfig) {
     this.registry = new ToolRegistry(config);
-    this.passthrough = new Set(config?.passthrough ?? DEFAULT_PASSTHROUGH);
+    const pt = config?.passthrough;
+    this.passthrough = new Set(
+      pt && pt.length > 0 ? pt : DEFAULT_PASSTHROUGH
+    );
     this.passthroughTools = [];
     this.debug = config?.debug ?? false;
 
