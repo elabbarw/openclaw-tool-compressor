@@ -33,7 +33,7 @@
     "agent"
   ],
   "author": "Wanis Elabbar <70503629+elabbarw@users.noreply.github.com>",
-  "license": "Apache-2.0",
+  "license": "MIT",
   "repository": {
     "type": "git",
     "url": "https://github.com/elabbarw/openclaw-tool-compressor"
