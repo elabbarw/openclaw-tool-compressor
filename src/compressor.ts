@@ -40,6 +40,9 @@ export interface ToolCallResult {
   error?: string;
 }
 
+/** Tools that are always passed through by default (core agent tools) */
+const DEFAULT_PASSTHROUGH = ["exec", "read", "write", "edit", "apply_patch", "bash"];
+
 export class ToolCompressor {
   private registry: ToolRegistry;
   private passthrough: Set<string>;
@@ -48,7 +51,7 @@ export class ToolCompressor {
 
   constructor(tools: ToolEntry[], config?: ToolCompressorConfig) {
     this.registry = new ToolRegistry(config);
-    this.passthrough = new Set(config?.passthrough ?? []);
+    this.passthrough = new Set(config?.passthrough ?? DEFAULT_PASSTHROUGH);
     this.passthroughTools = [];
     this.debug = config?.debug ?? false;
 
