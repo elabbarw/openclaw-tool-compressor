@@ -82,7 +82,6 @@ export function createProxyServer(config: ProxyConfig) {
   const port = config.port ?? 8100;
   const host = config.host ?? "127.0.0.1";
   const upstream = config.upstream.replace(/\/$/, "");
-  const maxLoop = config.maxLoopIterations ?? 10;
   const authHeaders: Record<string, string> = config.upstreamApiKey
     ? { "Authorization": `Bearer ${config.upstreamApiKey}` }
     : {};
@@ -122,14 +121,8 @@ export function createProxyServer(config: ProxyConfig) {
   /**
    * Process a chat completion request with tool compression.
    *
-   * 1. Extract tool definitions from the request
-   * 2. Build a ToolCompressor from them
-   * 3. Replace tools[] with compressed meta-tools
-   * 4. Forward to upstream
-   * 5. If the model calls search_tools or call_tool, handle internally
-   *    and re-prompt the model with results (loop)
-   * 6. Return final response when model produces content or calls
-   *    a non-meta tool
+   * Pure pass-through: compress the tools array, forward to upstream,
+   * return the response unchanged. The agent handles the tool call loop.
    */
   async function handleChatCompletion(
     reqBody: ChatCompletionRequest
@@ -141,15 +134,10 @@ export function createProxyServer(config: ProxyConfig) {
       return forwardToUpstream("/chat/completions", reqBody);
     }
 
-    // Build compressor from the original tool definitions
-    // We create stub execute functions since the proxy doesn't have
-    // access to the real tool implementations - it returns tool call
-    // requests back to the caller
+    // Build compressor to get compressed tool list
     const toolEntries: ToolEntry[] = originalTools.map((spec) => ({
       spec,
       execute: async () => {
-        // This won't be called for non-meta tools
-        // The proxy returns tool_calls back to the agent
         throw new Error("Direct execution not available in proxy mode");
       },
     }));
@@ -161,189 +149,14 @@ export function createProxyServer(config: ProxyConfig) {
         `${stats.compressedToolCount} (~${stats.estimatedTokenSavingsPercent}% savings)`
     );
 
-    // Replace tools with compressed meta-tools
-    const compressedReq: ChatCompletionRequest = {
+    // Replace tools with compressed meta-tools, forward everything else unchanged
+    return forwardToUpstream("/chat/completions", {
       ...reqBody,
       tools: compressor.getCompressedTools(),
-      // Force the model to not auto-parallelize meta-tool calls
-      // which can cause confusion
-    };
-
-    // Remove streaming for the internal loop (we'll stream the final response)
-    const wantStream = compressedReq.stream;
-    compressedReq.stream = false;
-
-    let messages = [...compressedReq.messages];
-    let iterations = 0;
-
-    // Internal loop: handle meta-tool calls without round-tripping to agent
-    while (iterations < maxLoop) {
-      iterations++;
-
-      const response = await forwardToUpstream("/chat/completions", {
-        ...compressedReq,
-        messages,
-        stream: false,
-      });
-
-      const choice = response.choices?.[0];
-      if (!choice) {
-        return response;
-      }
-
-      const toolCalls = choice.message.tool_calls;
-
-      // No tool calls? Model produced final content - return to agent
-      if (!toolCalls || toolCalls.length === 0) {
-        log(`Final response after ${iterations} iteration(s)`);
-        return response;
-      }
-
-      // Check if ANY tool call is a non-meta tool (passthrough or unknown)
-      const hasNonMetaCall = toolCalls.some(
-        (tc) =>
-          tc.function.name !== "search_tools" &&
-          tc.function.name !== "call_tool"
-      );
-
-      if (hasNonMetaCall) {
-        // Rewrite call_tool calls back to direct tool calls for the agent
-        const rewrittenCalls = [];
-        const metaResults: Array<{
-          tool_call_id: string;
-          result: unknown;
-        }> = [];
-
-        for (const tc of toolCalls) {
-          if (tc.function.name === "call_tool") {
-            // Rewrite call_tool -> direct tool call
-            try {
-              const args = JSON.parse(tc.function.arguments);
-              rewrittenCalls.push({
-                id: tc.id,
-                type: "function" as const,
-                function: {
-                  name: String(args.tool_name),
-                  arguments: JSON.stringify(args.arguments ?? {}),
-                },
-              });
-            } catch {
-              rewrittenCalls.push(tc);
-            }
-          } else if (tc.function.name === "search_tools") {
-            // Handle search internally, add result to messages
-            let args: Record<string, unknown>;
-            try {
-              args = JSON.parse(tc.function.arguments);
-            } catch {
-              args = {};
-            }
-            const searchResult = await compressor.handleToolCall(
-              "search_tools",
-              args
-            );
-            metaResults.push({
-              tool_call_id: tc.id,
-              result: searchResult.result ?? searchResult.error,
-            });
-          } else {
-            // Non-meta tool - pass through
-            rewrittenCalls.push(tc);
-          }
-        }
-
-        // If we have search results to inject, add them to messages and continue
-        if (metaResults.length > 0 && rewrittenCalls.length === 0) {
-          messages.push({
-            role: "assistant",
-            tool_calls: toolCalls,
-          });
-          for (const mr of metaResults) {
-            messages.push({
-              role: "tool",
-              tool_call_id: mr.tool_call_id,
-              content: JSON.stringify(mr.result),
-            });
-          }
-          continue;
-        }
-
-        // Return rewritten tool calls to the agent
-        if (rewrittenCalls.length > 0) {
-          response.choices[0].message.tool_calls = rewrittenCalls;
-          log(`Returning ${rewrittenCalls.length} rewritten tool call(s)`);
-          return response;
-        }
-      }
-
-      // All tool calls are meta-tools - handle internally
-      messages.push({
-        role: "assistant",
-        tool_calls: toolCalls,
-      });
-
-      for (const tc of toolCalls) {
-        let args: Record<string, unknown>;
-        try {
-          args = JSON.parse(tc.function.arguments);
-        } catch {
-          args = {};
-        }
-
-        const result = await compressor.handleToolCall(
-          tc.function.name,
-          args
-        );
-
-        messages.push({
-          role: "tool",
-          tool_call_id: tc.id,
-          content: JSON.stringify(result.result ?? result.error ?? ""),
-        });
-
-        log(
-          `  Handled ${tc.function.name} internally (iteration ${iterations})`
-        );
-      }
-    }
-
-    // Max iterations reached - return last state
-    log(`WARNING: Max loop iterations (${maxLoop}) reached`);
-    return forwardToUpstream("/chat/completions", {
-      ...compressedReq,
-      messages,
-      stream: false,
     });
   }
 
-  /**
-   * Sanitize upstream response to standard OpenAI format.
-   * Strips non-standard fields that can confuse agent frameworks.
-   */
-  function sanitizeResponse(resp: ChatCompletionResponse): ChatCompletionResponse {
-    return {
-      id: resp.id,
-      object: resp.object,
-      created: resp.created,
-      model: resp.model,
-      choices: resp.choices.map((choice) => ({
-        index: choice.index,
-        message: {
-          role: choice.message.role,
-          ...(choice.message.content != null ? { content: choice.message.content } : {}),
-          ...(choice.message.tool_calls ? { tool_calls: choice.message.tool_calls } : {}),
-        },
-        finish_reason: choice.finish_reason,
-      })),
-      ...(resp.usage ? {
-        usage: {
-          prompt_tokens: resp.usage.prompt_tokens,
-          completion_tokens: resp.usage.completion_tokens,
-          total_tokens: resp.usage.total_tokens,
-        },
-      } : {}),
-    };
-  }
+
 
   /**
    * HTTP request handler
@@ -396,14 +209,8 @@ export function createProxyServer(config: ProxyConfig) {
 
         const result = await handleChatCompletion(reqBody);
 
-        // Sanitize response to standard OpenAI format.
-        // LM Studio adds non-standard fields (reasoning_content, stats,
-        // system_fingerprint, completion_tokens_details) that can confuse
-        // agent frameworks like OpenClaw.
-        const sanitized = sanitizeResponse(result);
-
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify(sanitized));
+        res.end(JSON.stringify(result));
       } catch (err) {
         const message =
           err instanceof Error ? err.message : String(err);
