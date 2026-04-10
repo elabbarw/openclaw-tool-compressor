@@ -47,6 +47,8 @@ Options:
   --host <addr>       Host to bind to (default: 127.0.0.1)
   --max-results <n>   Max search results to return (default: 5)
   --max-loop <n>      Max internal loop iterations (default: 10)
+  --passthrough <list> Comma-separated tool names to keep uncompressed
+                      (e.g., exec,read_file,write_file)
   --api-key <key>     API key to send to upstream as Bearer token
   --debug             Enable debug logging
   --help              Show this help message
@@ -54,6 +56,9 @@ Options:
 Example:
   # Start proxy in front of LM Studio
   openclaw-tool-compressor --upstream http://localhost:1234/v1 --debug
+
+  # With passthrough for core tools
+  openclaw-tool-compressor --upstream http://localhost:1234/v1 --passthrough exec,read_file,write_file
 
   # Start proxy in front of OpenAI
   openclaw-tool-compressor --upstream https://api.openai.com/v1 --api-key sk-...
@@ -81,6 +86,9 @@ Example:
     maxLoopIterations: args["max-loop"]
       ? parseInt(args["max-loop"], 10)
       : 10,
+    passthrough: args.passthrough
+      ? args.passthrough.split(",").map((s: string) => s.trim())
+      : [],
     upstreamApiKey: args["api-key"] ?? undefined,
     debug: args.debug === "true",
   });
