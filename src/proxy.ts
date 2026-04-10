@@ -317,6 +317,35 @@ export function createProxyServer(config: ProxyConfig) {
   }
 
   /**
+   * Sanitize upstream response to standard OpenAI format.
+   * Strips non-standard fields that can confuse agent frameworks.
+   */
+  function sanitizeResponse(resp: ChatCompletionResponse): ChatCompletionResponse {
+    return {
+      id: resp.id,
+      object: resp.object,
+      created: resp.created,
+      model: resp.model,
+      choices: resp.choices.map((choice) => ({
+        index: choice.index,
+        message: {
+          role: choice.message.role,
+          ...(choice.message.content != null ? { content: choice.message.content } : {}),
+          ...(choice.message.tool_calls ? { tool_calls: choice.message.tool_calls } : {}),
+        },
+        finish_reason: choice.finish_reason,
+      })),
+      ...(resp.usage ? {
+        usage: {
+          prompt_tokens: resp.usage.prompt_tokens,
+          completion_tokens: resp.usage.completion_tokens,
+          total_tokens: resp.usage.total_tokens,
+        },
+      } : {}),
+    };
+  }
+
+  /**
    * HTTP request handler
    */
   async function handleRequest(
@@ -367,8 +396,14 @@ export function createProxyServer(config: ProxyConfig) {
 
         const result = await handleChatCompletion(reqBody);
 
+        // Sanitize response to standard OpenAI format.
+        // LM Studio adds non-standard fields (reasoning_content, stats,
+        // system_fingerprint, completion_tokens_details) that can confuse
+        // agent frameworks like OpenClaw.
+        const sanitized = sanitizeResponse(result);
+
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify(result));
+        res.end(JSON.stringify(sanitized));
       } catch (err) {
         const message =
           err instanceof Error ? err.message : String(err);
