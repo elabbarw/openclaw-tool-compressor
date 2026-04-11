@@ -97,8 +97,9 @@ export function createProxyServer(config: ProxyConfig) {
    */
   async function forwardToUpstream(
     path: string,
-    body: unknown
-  ): Promise<ChatCompletionResponse> {
+    body: unknown,
+    res?: ServerResponse
+  ): Promise<ChatCompletionResponse | null> {
     const url = `${upstream}${path}`;
     log(`-> ${url}`);
 
@@ -108,11 +109,14 @@ export function createProxyServer(config: ProxyConfig) {
       body: JSON.stringify(body),
     });
 
-    if (!response.ok) {
-      const text = await response.text();
-      throw new Error(
-        `Upstream ${response.status}: ${text.slice(0, 500)}`
-      );
+    // Pass through the upstream response as-is (including errors)
+    if (res) {
+      const data = await response.text();
+      res.writeHead(response.status, {
+        "Content-Type": response.headers.get("content-type") ?? "application/json",
+      });
+      res.end(data);
+      return null;
     }
 
     return response.json() as Promise<ChatCompletionResponse>;
@@ -125,13 +129,15 @@ export function createProxyServer(config: ProxyConfig) {
    * return the response unchanged. The agent handles the tool call loop.
    */
   async function handleChatCompletion(
-    reqBody: ChatCompletionRequest
-  ): Promise<ChatCompletionResponse> {
+    reqBody: ChatCompletionRequest,
+    res: ServerResponse
+  ): Promise<void> {
     const originalTools = reqBody.tools ?? [];
 
     // No tools? Pass through unchanged
     if (originalTools.length === 0) {
-      return forwardToUpstream("/chat/completions", reqBody);
+      await forwardToUpstream("/chat/completions", reqBody, res);
+      return;
     }
 
     // Build compressor to get compressed tool list
@@ -150,10 +156,10 @@ export function createProxyServer(config: ProxyConfig) {
     );
 
     // Replace tools with compressed meta-tools, forward everything else unchanged
-    return forwardToUpstream("/chat/completions", {
+    await forwardToUpstream("/chat/completions", {
       ...reqBody,
       tools: compressor.getCompressedTools(),
-    });
+    }, res);
   }
 
 
@@ -203,21 +209,9 @@ export function createProxyServer(config: ProxyConfig) {
       (req.url === "/v1/chat/completions" ||
         req.url === "/chat/completions")
     ) {
-      try {
-        const body = await readBody(req);
-        const reqBody = JSON.parse(body) as ChatCompletionRequest;
-
-        const result = await handleChatCompletion(reqBody);
-
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify(result));
-      } catch (err) {
-        const message =
-          err instanceof Error ? err.message : String(err);
-        log(`ERROR: ${message}`);
-        res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "Internal server error" }));
-      }
+      const body = await readBody(req);
+      const reqBody = JSON.parse(body) as ChatCompletionRequest;
+      await handleChatCompletion(reqBody, res);
       return;
     }
 
