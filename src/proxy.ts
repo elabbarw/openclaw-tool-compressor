@@ -93,40 +93,101 @@ export function createProxyServer(config: ProxyConfig) {
   };
 
   /**
-   * Forward a request to the upstream LLM API.
+   * Forward a request to the upstream LLM API and stream the raw response
+   * back to the caller. Used for non-meta-tool paths.
    */
-  async function forwardToUpstream(
+  async function forwardAndPipe(
     path: string,
     body: unknown,
-    res?: ServerResponse
-  ): Promise<ChatCompletionResponse | null> {
+    res: ServerResponse
+  ): Promise<void> {
     const url = `${upstream}${path}`;
-    log(`-> ${url}`);
-
+    log(`-> ${url} (pipe)`);
     const response = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json", ...authHeaders },
       body: JSON.stringify(body),
     });
+    const data = await response.text();
+    res.writeHead(response.status, {
+      "Content-Type": response.headers.get("content-type") ?? "application/json",
+    });
+    res.end(data);
+  }
 
-    // Pass through the upstream response as-is (including errors)
-    if (res) {
-      const data = await response.text();
-      res.writeHead(response.status, {
-        "Content-Type": response.headers.get("content-type") ?? "application/json",
-      });
-      res.end(data);
-      return null;
+  /**
+   * Forward a request to the upstream LLM API and parse the JSON response.
+   * Used inside the meta-tool loop.
+   */
+  async function forwardForJson(
+    path: string,
+    body: unknown
+  ): Promise<{ ok: boolean; status: number; body: string; json?: ChatCompletionResponse }> {
+    const url = `${upstream}${path}`;
+    log(`-> ${url}`);
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders },
+      body: JSON.stringify(body),
+    });
+    const text = await response.text();
+    if (!response.ok) {
+      return { ok: false, status: response.status, body: text };
     }
+    try {
+      return {
+        ok: true,
+        status: response.status,
+        body: text,
+        json: JSON.parse(text) as ChatCompletionResponse,
+      };
+    } catch {
+      return { ok: false, status: 502, body: text };
+    }
+  }
 
-    return response.json() as Promise<ChatCompletionResponse>;
+  /** Safely parse tool_call arguments (model may send string or object). */
+  function parseArgs(raw: string | undefined): Record<string, unknown> {
+    if (!raw) return {};
+    try {
+      return JSON.parse(raw) as Record<string, unknown>;
+    } catch {
+      return {};
+    }
+  }
+
+  /**
+   * Rewrite a `call_tool` tool_call into the real tool call it wraps.
+   * Leaves other tool_calls untouched.
+   */
+  function unwrapCallTool(
+    tc: NonNullable<ChatCompletionResponse["choices"][0]["message"]["tool_calls"]>[0]
+  ): typeof tc {
+    if (tc.function.name !== "call_tool") return tc;
+    const parsed = parseArgs(tc.function.arguments);
+    const realName = String(parsed.tool_name ?? "");
+    if (!realName) return tc;
+    const rawArgs = parsed.arguments;
+    const argsStr =
+      typeof rawArgs === "string"
+        ? rawArgs
+        : JSON.stringify(rawArgs ?? {});
+    return {
+      ...tc,
+      function: { name: realName, arguments: argsStr },
+    };
   }
 
   /**
    * Process a chat completion request with tool compression.
    *
-   * Pure pass-through: compress the tools array, forward to upstream,
-   * return the response unchanged. The agent handles the tool call loop.
+   * Intercepts the search/call meta-tool loop so the caller only ever sees
+   * real tool names it knows how to execute:
+   *   - `search_tools` calls are resolved internally against the compressed
+   *     registry and re-prompted to the model.
+   *   - `call_tool` calls are rewritten to `{real_tool_name, real_args}` and
+   *     returned to the caller for execution via its own tool runtime.
+   *   - Real (passthrough) tool calls are returned unchanged.
    */
   async function handleChatCompletion(
     reqBody: ChatCompletionRequest,
@@ -134,20 +195,20 @@ export function createProxyServer(config: ProxyConfig) {
   ): Promise<void> {
     const originalTools = reqBody.tools ?? [];
 
-    // No tools? Pass through unchanged
+    // No tools? Pass through unchanged.
     if (originalTools.length === 0) {
-      await forwardToUpstream("/chat/completions", reqBody, res);
+      await forwardAndPipe("/chat/completions", reqBody, res);
       return;
     }
 
-    // Build compressor to get compressed tool list
+    // Build compressor. The execute stubs are never invoked here — we only
+    // use the compressor for its search_tools logic and registry lookups.
     const toolEntries: ToolEntry[] = originalTools.map((spec) => ({
       spec,
       execute: async () => {
-        throw new Error("Direct execution not available in proxy mode");
+        throw new Error("proxy does not execute tools; caller does");
       },
     }));
-
     const compressor = new ToolCompressor(toolEntries, config);
     const stats = compressor.getStats();
     log(
@@ -155,11 +216,99 @@ export function createProxyServer(config: ProxyConfig) {
         `${stats.compressedToolCount} (~${stats.estimatedTokenSavingsPercent}% savings)`
     );
 
-    // Replace tools with compressed meta-tools, forward everything else unchanged
-    await forwardToUpstream("/chat/completions", {
-      ...reqBody,
-      tools: compressor.getCompressedTools(),
-    }, res);
+    const compressedTools = compressor.getCompressedTools();
+    const maxIters = config.maxLoopIterations ?? 10;
+    // Copy messages so we can append without mutating the caller's array.
+    const messages = [...reqBody.messages];
+
+    for (let iter = 0; iter < maxIters; iter++) {
+      const upstreamResult = await forwardForJson("/chat/completions", {
+        ...reqBody,
+        messages,
+        tools: compressedTools,
+      });
+
+      if (!upstreamResult.ok || !upstreamResult.json) {
+        res.writeHead(upstreamResult.status, {
+          "Content-Type": "application/json",
+        });
+        res.end(upstreamResult.body);
+        return;
+      }
+
+      const response = upstreamResult.json;
+      const choice = response.choices?.[0];
+      const toolCalls = choice?.message?.tool_calls ?? [];
+
+      // No tool calls — model produced a final answer. Return as-is.
+      if (toolCalls.length === 0) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(response));
+        return;
+      }
+
+      const searchCalls = toolCalls.filter(
+        (tc) => tc.function.name === "search_tools"
+      );
+
+      // No search_tools this turn — rewrite any call_tool to the real tool
+      // and hand the response to the caller. The caller knows how to run
+      // real tools; it does not know search_tools/call_tool exist.
+      if (searchCalls.length === 0) {
+        const rewritten = toolCalls.map(unwrapCallTool);
+        const finalResponse: ChatCompletionResponse = {
+          ...response,
+          choices: response.choices.map((c, i) =>
+            i === 0
+              ? {
+                  ...c,
+                  message: { ...c.message, tool_calls: rewritten },
+                }
+              : c
+          ),
+        };
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(finalResponse));
+        return;
+      }
+
+      // Has search_tools. Resolve them internally, append assistant turn and
+      // tool results into the conversation, and re-prompt upstream.
+      //
+      // If the model also emitted call_tool / real tool calls in the same
+      // turn, we intentionally omit them from the injected assistant message:
+      // we have no results for them (the caller executes those), and the
+      // OpenAI tool protocol requires a matching tool result for every
+      // tool_call in an assistant message. The model will typically re-emit
+      // the real calls on the next turn with search results in context.
+      log(`Resolving ${searchCalls.length} search_tools call(s) internally`);
+      messages.push({
+        role: "assistant",
+        content: choice?.message?.content ?? null,
+        tool_calls: searchCalls,
+      });
+      for (const sc of searchCalls) {
+        const args = parseArgs(sc.function.arguments);
+        const result = await compressor.handleToolCall("search_tools", args);
+        const payload = result.error
+          ? { error: result.error }
+          : result.result ?? {};
+        messages.push({
+          role: "tool",
+          tool_call_id: sc.id,
+          content: JSON.stringify(payload),
+        });
+      }
+      // Loop: re-call upstream with search results injected.
+    }
+
+    log(`Max meta-tool loop iterations (${maxIters}) exceeded`);
+    res.writeHead(500, { "Content-Type": "application/json" });
+    res.end(
+      JSON.stringify({
+        error: `Proxy exceeded ${maxIters} internal meta-tool iterations`,
+      })
+    );
   }
 
 
