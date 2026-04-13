@@ -346,13 +346,30 @@ export function createProxyServer(config: ProxyConfig) {
       // Loop: re-call upstream with search results injected.
     }
 
-    log(`Max meta-tool loop iterations (${maxIters}) exceeded`);
-    res.writeHead(500, { "Content-Type": "application/json" });
-    res.end(
-      JSON.stringify({
-        error: `Proxy exceeded ${maxIters} internal meta-tool iterations`,
-      })
-    );
+    // Max iterations reached. Don't forward the model's last (probably
+    // still-looping) response — that would hand search_tools/call_tool back
+    // to the caller, which has no handler for them. Instead synthesize a
+    // clean stop message so the caller's agent loop can terminate gracefully.
+    log(`WARNING: Max meta-tool loop iterations (${maxIters}) reached`);
+    const stopResponse: ChatCompletionResponse = {
+      id: `proxy-maxiter-${Date.now()}`,
+      object: "chat.completion",
+      created: Math.floor(Date.now() / 1000),
+      model: String(reqBody.model ?? ""),
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: "assistant",
+            content:
+              `Max tool iterations (${maxIters}) reached. ` +
+              `Proceeding with available data.`,
+          },
+          finish_reason: "stop",
+        },
+      ],
+    };
+    sendFinal(res, stopResponse, wantStream);
   }
 
 
