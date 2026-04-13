@@ -190,7 +190,10 @@ export class ToolCompressor {
       };
     }
 
-    if (!this.registry.has(toolName)) {
+    // Auto-correct single-underscore → double-underscore name mangling
+    // (model occasionally drops one underscore from MCP-style names).
+    const resolved = this.registry.resolveName(toolName);
+    if (!resolved) {
       // Tool not found - help the model recover
       const suggestion = toolName.includes("_")
         ? toolName.split("_").join(" ")
@@ -202,10 +205,13 @@ export class ToolCompressor {
           `Try: search_tools with query "${suggestion}" to find the right tool.`,
       };
     }
+    if (resolved !== toolName) {
+      this.log(`Normalised tool name: ${toolName} -> ${resolved}`);
+    }
 
-    this.log(`call_tool: ${toolName}(${JSON.stringify(toolArgs).slice(0, 100)})`);
+    this.log(`call_tool: ${resolved}(${JSON.stringify(toolArgs).slice(0, 100)})`);
 
-    const execute = this.registry.getExecute(toolName);
+    const execute = this.registry.getExecute(resolved);
     if (!execute) {
       return {
         handled: true,
@@ -215,17 +221,26 @@ export class ToolCompressor {
 
     try {
       const result = await execute(toolArgs);
-      this.log(`  call_tool ${toolName}: success`);
+      this.log(`  call_tool ${resolved}: success`);
       return { handled: true, result };
     } catch (err) {
       const message =
         err instanceof Error ? err.message : String(err);
-      this.log(`  call_tool ${toolName}: error - ${message}`);
+      this.log(`  call_tool ${resolved}: error - ${message}`);
       return {
         handled: true,
-        error: `Tool "${toolName}" failed: ${message}`,
+        error: `Tool "${resolved}" failed: ${message}`,
       };
     }
+  }
+
+  /**
+   * Resolve a possibly-mangled tool name to its canonical registered name.
+   * Returns null if no match. Exposed so downstream rewriters (e.g. the
+   * proxy) can apply the same normalisation when unwrapping call_tool.
+   */
+  resolveToolName(name: string): string | null {
+    return this.registry.resolveName(name);
   }
 
   /** Get token savings estimate */

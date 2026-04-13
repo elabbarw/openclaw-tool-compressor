@@ -200,14 +200,23 @@ export function createProxyServer(config: ProxyConfig) {
   /**
    * Rewrite a `call_tool` tool_call into the real tool call it wraps.
    * Leaves other tool_calls untouched.
+   *
+   * Applies single→double underscore normalisation via `compressor` so that
+   * `server_tool` (model dropped an underscore) resolves to the registered
+   * `server__tool` before being handed to the caller.
    */
   function unwrapCallTool(
-    tc: NonNullable<ChatCompletionResponse["choices"][0]["message"]["tool_calls"]>[0]
+    tc: NonNullable<ChatCompletionResponse["choices"][0]["message"]["tool_calls"]>[0],
+    compressor: ToolCompressor
   ): typeof tc {
     if (tc.function.name !== "call_tool") return tc;
     const parsed = parseArgs(tc.function.arguments);
-    const realName = String(parsed.tool_name ?? "");
-    if (!realName) return tc;
+    const rawName = String(parsed.tool_name ?? "");
+    if (!rawName) return tc;
+    const realName = compressor.resolveToolName(rawName) ?? rawName;
+    if (realName !== rawName) {
+      log(`Normalised tool name: ${rawName} -> ${realName}`);
+    }
     const rawArgs = parsed.arguments;
     const argsStr =
       typeof rawArgs === "string"
@@ -300,7 +309,7 @@ export function createProxyServer(config: ProxyConfig) {
       // and hand the response to the caller. The caller knows how to run
       // real tools; it does not know search_tools/call_tool exist.
       if (searchCalls.length === 0) {
-        const rewritten = toolCalls.map(unwrapCallTool);
+        const rewritten = toolCalls.map((tc) => unwrapCallTool(tc, compressor));
         const finalResponse: ChatCompletionResponse = {
           ...response,
           choices: response.choices.map((c, i) =>

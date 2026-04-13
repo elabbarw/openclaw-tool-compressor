@@ -64,6 +64,24 @@ export class ToolRegistry {
     return this.entries.has(name);
   }
 
+  /**
+   * Resolve a possibly-mangled tool name to a registered one.
+   *
+   * Models sometimes drop one underscore from MCP-style `{server}__{tool}`
+   * names, emitting `server_tool` instead of `server__tool`. If the exact
+   * name isn't registered, try promoting the first single underscore to a
+   * double underscore. Returns the canonical name, or null if no match.
+   */
+  resolveName(name: string): string | null {
+    if (this.entries.has(name)) return name;
+    const m = name.match(/^([^_]+)_([^_].*)$/);
+    if (m) {
+      const normalised = `${m[1]}__${m[2]}`;
+      if (this.entries.has(normalised)) return normalised;
+    }
+    return null;
+  }
+
   /** Get a tool's execute function */
   getExecute(name: string): ToolExecuteFn | undefined {
     return this.entries.get(name)?.execute;
