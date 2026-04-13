@@ -157,6 +157,47 @@ export function createProxyServer(config: ProxyConfig) {
   }
 
   /**
+   * Emit a final chat completion response to the caller in either plain JSON
+   * or SSE (OpenAI streaming) format, depending on what the caller asked for.
+   *
+   * The meta-tool loop always runs against a non-streaming upstream because
+   * it needs to inspect complete tool_calls. If the original caller requested
+   * `stream: true`, we re-emit the final assembled response as a single SSE
+   * chunk followed by `[DONE]`.
+   */
+  function sendFinal(
+    res: ServerResponse,
+    response: ChatCompletionResponse,
+    wantStream: boolean
+  ): void {
+    if (!wantStream) {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(response));
+      return;
+    }
+
+    const chunk = {
+      id: response.id,
+      object: "chat.completion.chunk",
+      created: response.created,
+      model: response.model,
+      choices: response.choices.map((c) => ({
+        index: c.index,
+        delta: c.message,
+        finish_reason: c.finish_reason,
+        logprobs: null,
+      })),
+    };
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      "Connection": "keep-alive",
+    });
+    res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+    res.end("data: [DONE]\n\n");
+  }
+
+  /**
    * Rewrite a `call_tool` tool_call into the real tool call it wraps.
    * Leaves other tool_calls untouched.
    */
@@ -220,12 +261,17 @@ export function createProxyServer(config: ProxyConfig) {
     const maxIters = config.maxLoopIterations ?? 10;
     // Copy messages so we can append without mutating the caller's array.
     const messages = [...reqBody.messages];
+    // Remember whether the caller wanted streaming. Upstream is always called
+    // non-streaming inside the meta-loop; we re-emit SSE at the very end if
+    // the original request had stream: true.
+    const wantStream = reqBody.stream === true;
 
     for (let iter = 0; iter < maxIters; iter++) {
       const upstreamResult = await forwardForJson("/chat/completions", {
         ...reqBody,
         messages,
         tools: compressedTools,
+        stream: false,
       });
 
       if (!upstreamResult.ok || !upstreamResult.json) {
@@ -242,8 +288,7 @@ export function createProxyServer(config: ProxyConfig) {
 
       // No tool calls — model produced a final answer. Return as-is.
       if (toolCalls.length === 0) {
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify(response));
+        sendFinal(res, response, wantStream);
         return;
       }
 
@@ -267,8 +312,7 @@ export function createProxyServer(config: ProxyConfig) {
               : c
           ),
         };
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify(finalResponse));
+        sendFinal(res, finalResponse, wantStream);
         return;
       }
 
