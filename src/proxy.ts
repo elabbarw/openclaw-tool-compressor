@@ -93,8 +93,9 @@ export function createProxyServer(config: ProxyConfig) {
   };
 
   /**
-   * Forward a request to the upstream LLM API and stream the raw response
-   * back to the caller. Used for non-meta-tool paths.
+   * Forward a request to the upstream LLM API and pipe the response body
+   * through to the caller chunk-by-chunk. Used for the no-tools passthrough
+   * path so long streaming responses don't get buffered.
    */
   async function forwardAndPipe(
     path: string,
@@ -108,42 +109,327 @@ export function createProxyServer(config: ProxyConfig) {
       headers: { "Content-Type": "application/json", ...authHeaders },
       body: JSON.stringify(body),
     });
-    const data = await response.text();
+
     res.writeHead(response.status, {
       "Content-Type": response.headers.get("content-type") ?? "application/json",
     });
-    res.end(data);
+
+    if (!response.body) {
+      res.end();
+      return;
+    }
+
+    const reader = response.body.getReader();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      res.write(Buffer.from(value));
+    }
+    res.end();
   }
 
   /**
-   * Forward a request to the upstream LLM API and parse the JSON response.
-   * Used inside the meta-tool loop.
+   * Result of a single upstream iteration.
+   * - "piped": content was streamed directly to the caller, nothing more to do.
+   * - "buffered": full response assembled — caller decides whether to re-prompt
+   *   (meta-tool loop) or emit to the client.
+   * - "error": upstream failed.
    */
-  async function forwardForJson(
-    path: string,
-    body: unknown
-  ): Promise<{ ok: boolean; status: number; body: string; json?: ChatCompletionResponse }> {
-    const url = `${upstream}${path}`;
-    log(`-> ${url}`);
-    const response = await fetch(url, {
+  type IterationResult =
+    | { kind: "piped" }
+    | { kind: "buffered"; response: ChatCompletionResponse }
+    | { kind: "error"; status: number; body: string };
+
+  /**
+   * Run one upstream iteration.
+   *
+   * If `wantStream` is false, the upstream call is non-streaming and the full
+   * JSON response is returned as `buffered`.
+   *
+   * If `wantStream` is true, the upstream call is streaming and the SSE is
+   * parsed as it arrives. The first meaningful delta decides the mode:
+   *   - delta contains tool_calls  → buffer the whole response (we need the
+   *     full assembled tool_calls to detect search_tools / rewrite call_tool).
+   *   - delta contains content     → start piping SSE directly to the caller
+   *     (the long code-gen case — keeps the connection alive).
+   *
+   * When content starts piping, any SSE lines already consumed during the
+   * detection phase are flushed to the caller first so no tokens are lost.
+   */
+  async function runUpstreamIteration(
+    body: unknown,
+    res: ServerResponse,
+    wantStream: boolean
+  ): Promise<IterationResult> {
+    const url = `${upstream}/chat/completions`;
+    log(`-> ${url}${wantStream ? " (stream)" : ""}`);
+
+    const upstreamResp = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json", ...authHeaders },
       body: JSON.stringify(body),
     });
-    const text = await response.text();
-    if (!response.ok) {
-      return { ok: false, status: response.status, body: text };
+
+    if (!upstreamResp.ok) {
+      const text = await upstreamResp.text();
+      return { kind: "error", status: upstreamResp.status, body: text };
     }
+
+    if (!wantStream) {
+      const text = await upstreamResp.text();
+      try {
+        return {
+          kind: "buffered",
+          response: JSON.parse(text) as ChatCompletionResponse,
+        };
+      } catch {
+        return { kind: "error", status: 502, body: text };
+      }
+    }
+
+    // Some upstreams silently ignore `stream: true` and return a single JSON
+    // blob with Content-Type: application/json. Detect that and fall back to
+    // the non-streaming path so we don't mis-parse it as SSE.
+    const upstreamCt = upstreamResp.headers.get("content-type") ?? "";
+    if (
+      upstreamCt.includes("application/json") &&
+      !upstreamCt.includes("event-stream")
+    ) {
+      log("upstream ignored stream: true, falling back to JSON parse");
+      const text = await upstreamResp.text();
+      try {
+        return {
+          kind: "buffered",
+          response: JSON.parse(text) as ChatCompletionResponse,
+        };
+      } catch {
+        return { kind: "error", status: 502, body: text };
+      }
+    }
+
+    if (!upstreamResp.body) {
+      return { kind: "error", status: 502, body: "upstream returned no body" };
+    }
+
+    // Streaming path — parse SSE on the fly.
+    const reader = upstreamResp.body.getReader();
+    const decoder = new TextDecoder();
+    let lineBuf = "";
+
+    // Raw SSE lines held during the detect phase. If we switch to pipe mode
+    // we flush these to the caller before streaming the rest.
+    const heldLines: string[] = [];
+
+    type Mode = "detect" | "pipe" | "buffer";
+    let mode: Mode = "detect";
+    let sseHeadersWritten = false;
+    let doneSeen = false;
+
+    // Running assembly of the full response (used in buffer mode).
+    const assembled = {
+      id: "",
+      object: "chat.completion",
+      created: Math.floor(Date.now() / 1000),
+      model: "",
+      role: "assistant",
+      content: "",
+      finishReason: "stop",
+      toolCalls: [] as Array<{
+        id?: string;
+        type?: string;
+        function: { name: string; arguments: string };
+      }>,
+    };
+
+    const writeSseHeaders = () => {
+      if (sseHeadersWritten) return;
+      sseHeadersWritten = true;
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+      });
+    };
+
+    const flushHeldToPipe = () => {
+      writeSseHeaders();
+      for (const l of heldLines) res.write(l + "\n");
+      heldLines.length = 0;
+    };
+
+    const mergeDelta = (chunk: Record<string, unknown>): void => {
+      if (typeof chunk.id === "string") assembled.id = chunk.id;
+      if (typeof chunk.model === "string") assembled.model = chunk.model;
+      if (typeof chunk.created === "number") assembled.created = chunk.created;
+      const choices = chunk.choices as Array<Record<string, unknown>> | undefined;
+      const ch0 = choices?.[0];
+      if (!ch0) return;
+      if (typeof ch0.finish_reason === "string") {
+        assembled.finishReason = ch0.finish_reason;
+      }
+      const delta = ch0.delta as Record<string, unknown> | undefined;
+      if (!delta) return;
+      if (typeof delta.role === "string") assembled.role = delta.role;
+      if (typeof delta.content === "string") assembled.content += delta.content;
+      const tcArr = delta.tool_calls as
+        | Array<{
+            index?: number;
+            id?: string;
+            type?: string;
+            function?: { name?: string; arguments?: string };
+          }>
+        | undefined;
+      if (Array.isArray(tcArr)) {
+        for (const tc of tcArr) {
+          const idx =
+            typeof tc.index === "number" ? tc.index : assembled.toolCalls.length;
+          if (!assembled.toolCalls[idx]) {
+            assembled.toolCalls[idx] = { function: { name: "", arguments: "" } };
+          }
+          const slot = assembled.toolCalls[idx];
+          if (tc.id) slot.id = tc.id;
+          if (tc.type) slot.type = tc.type;
+          if (tc.function?.name) slot.function.name += tc.function.name;
+          if (tc.function?.arguments) {
+            slot.function.arguments += tc.function.arguments;
+          }
+        }
+      }
+    };
+
+    const processLine = (rawLine: string): void => {
+      const trimmed = rawLine.trimEnd();
+
+      // Blank line = SSE event separator.
+      if (trimmed === "") {
+        if (mode === "pipe") res.write("\n");
+        else heldLines.push(rawLine);
+        return;
+      }
+
+      if (!trimmed.startsWith("data:")) {
+        if (mode === "pipe") res.write(rawLine + "\n");
+        else heldLines.push(rawLine);
+        return;
+      }
+
+      const dataStr = trimmed.slice(5).trimStart();
+
+      if (dataStr === "[DONE]") {
+        doneSeen = true;
+        if (mode === "pipe") res.write("data: [DONE]\n\n");
+        return;
+      }
+
+      let chunk: Record<string, unknown>;
+      try {
+        chunk = JSON.parse(dataStr) as Record<string, unknown>;
+      } catch {
+        if (mode === "pipe") res.write(rawLine + "\n");
+        else heldLines.push(rawLine);
+        return;
+      }
+
+      mergeDelta(chunk);
+
+      // Decide mode on the first delta that carries content or a tool name.
+      if (mode === "detect") {
+        const firstTcName = assembled.toolCalls[0]?.function.name;
+        if (firstTcName) {
+          mode = "buffer";
+        } else if (assembled.content.length > 0) {
+          mode = "pipe";
+          flushHeldToPipe();
+          res.write(rawLine + "\n");
+          return;
+        }
+      }
+
+      // Defensive: if a meta-tool call appears AFTER we committed to pipe
+      // mode (model emitted content then called search_tools/call_tool in
+      // the same turn), we can't rewrite in-place — we've already streamed
+      // the earlier chunks. Log so this is visible; the caller will see a
+      // tool_call it can't execute and surface its own error.
+      if (mode === "pipe") {
+        const leakedName = assembled.toolCalls[0]?.function.name;
+        if (
+          leakedName === "search_tools" ||
+          leakedName === "call_tool"
+        ) {
+          log(
+            `WARNING: meta-tool "${leakedName}" emitted after content in pipe ` +
+              `mode — cannot rewrite; caller will see it unchanged`
+          );
+        }
+      }
+
+      if (mode === "pipe") {
+        res.write(rawLine + "\n");
+      } else {
+        heldLines.push(rawLine);
+      }
+    };
+
     try {
-      return {
-        ok: true,
-        status: response.status,
-        body: text,
-        json: JSON.parse(text) as ChatCompletionResponse,
-      };
-    } catch {
-      return { ok: false, status: 502, body: text };
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        lineBuf += decoder.decode(value, { stream: true });
+        let nl: number;
+        while ((nl = lineBuf.indexOf("\n")) !== -1) {
+          const line = lineBuf.slice(0, nl);
+          lineBuf = lineBuf.slice(nl + 1);
+          processLine(line);
+        }
+      }
+      // Flush any trailing partial line.
+      if (lineBuf.length > 0) processLine(lineBuf);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log(`Upstream read error: ${msg}`);
+      // If we've already started piping to the caller we can't change our
+      // mind — close the SSE stream cleanly so the client sees a terminator
+      // rather than a truncated connection.
+      if ((mode as Mode) === "pipe") {
+        if (!doneSeen) res.write("data: [DONE]\n\n");
+        res.end();
+        return { kind: "piped" };
+      }
+      return { kind: "error", status: 502, body: `upstream read error: ${msg}` };
     }
+
+    if ((mode as Mode) === "pipe") {
+      if (!doneSeen) res.write("data: [DONE]\n\n");
+      res.end();
+      return { kind: "piped" };
+    }
+
+    // Buffered or undecided (empty response) — assemble a ChatCompletionResponse.
+    const message: ChatCompletionResponse["choices"][0]["message"] = {
+      role: assembled.role,
+      content: assembled.content.length > 0 ? assembled.content : null,
+    };
+    if (assembled.toolCalls.length > 0) {
+      message.tool_calls = assembled.toolCalls.map((tc, i) => ({
+        id: tc.id ?? `call_${i}`,
+        type: (tc.type as "function") ?? "function",
+        function: tc.function,
+      }));
+    }
+    const full: ChatCompletionResponse = {
+      id: assembled.id || `proxy-${Date.now()}`,
+      object: "chat.completion",
+      created: assembled.created,
+      model: assembled.model,
+      choices: [
+        {
+          index: 0,
+          message,
+          finish_reason: assembled.finishReason,
+        },
+      ],
+    };
+    return { kind: "buffered", response: full };
   }
 
   /** Safely parse tool_call arguments (model may send string or object). */
@@ -276,22 +562,36 @@ export function createProxyServer(config: ProxyConfig) {
     const wantStream = reqBody.stream === true;
 
     for (let iter = 0; iter < maxIters; iter++) {
-      const upstreamResult = await forwardForJson("/chat/completions", {
-        ...reqBody,
-        messages,
-        tools: compressedTools,
-        stream: false,
-      });
+      const iterResult = await runUpstreamIteration(
+        {
+          ...reqBody,
+          messages,
+          tools: compressedTools,
+          // Upstream streams only if the caller wanted streaming. When the
+          // response is a content turn (e.g. long code generation), SSE is
+          // piped directly from upstream to caller without buffering.
+          stream: wantStream,
+        },
+        res,
+        wantStream
+      );
 
-      if (!upstreamResult.ok || !upstreamResult.json) {
-        res.writeHead(upstreamResult.status, {
-          "Content-Type": "application/json",
-        });
-        res.end(upstreamResult.body);
+      if (iterResult.kind === "error") {
+        if (!res.headersSent) {
+          res.writeHead(iterResult.status, {
+            "Content-Type": "application/json",
+          });
+        }
+        res.end(iterResult.body);
         return;
       }
 
-      const response = upstreamResult.json;
+      // Content already streamed to the caller. Nothing more to do.
+      if (iterResult.kind === "piped") {
+        return;
+      }
+
+      const response = iterResult.response;
       const choice = response.choices?.[0];
       const toolCalls = choice?.message?.tool_calls ?? [];
 
