@@ -103,11 +103,23 @@ describe("ToolCompressor", () => {
       expect(result.handled).toBe(true);
       expect(result.error).toBeUndefined();
 
-      const data = result.result as { tools: Array<{ name: string }>; matchCount: number };
-      expect(data.matchCount).toBeGreaterThan(0);
+      const data = result.result as { tools: Array<{ name: string }> };
+      expect(data.tools.length).toBeGreaterThan(0);
 
       // jira_create_issue should be the top result
       expect(data.tools[0].name).toBe("jira_create_issue");
+    });
+
+    it("should return only the tools field on a successful match", async () => {
+      const compressor = new ToolCompressor(mockMcpTools());
+      const result = await compressor.handleToolCall("search_tools", {
+        query: "jira",
+      });
+
+      expect(result.handled).toBe(true);
+      // Response is trimmed to just { tools } — no matchCount/totalAvailable/hint.
+      const data = result.result as Record<string, unknown>;
+      expect(Object.keys(data).sort()).toEqual(["tools"]);
     });
 
     it("should find gitlab merge request tools when searching 'PR'", async () => {

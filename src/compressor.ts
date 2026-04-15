@@ -11,7 +11,12 @@
  *   // Pass compressedTools to the LLM instead of toolDefinitions
  *   // Handle meta-tool calls via compressor.handleToolCall()
  *
- * Lifecycle: per-request. Create fresh, discard after response.
+ * Lifecycle: each instance is immutable after construction. Library
+ * consumers typically create one per request and discard it. The proxy
+ * (see LruCache in proxy.ts) caches and reuses instances across requests
+ * with matching tool sets. Do not introduce mutable per-request state on
+ * this class or its inner registry — it would silently leak across
+ * requests in proxy mode.
  */
 
 import { ToolRegistry } from "./registry.js";
@@ -138,7 +143,8 @@ export class ToolCompressor {
     const result = this.registry.search(query);
 
     if ("matches" in result) {
-      // Found matches - return full specs
+      // Found matches - return full specs. Keep the payload minimal:
+      // the model only needs the tool schemas to decide its next call.
       const sr = result as SearchResult;
       this.log(
         `  Found ${sr.matches.length} matches (${sr.totalAvailable} total)`
@@ -147,11 +153,6 @@ export class ToolCompressor {
         handled: true,
         result: {
           tools: sr.matches.map((m) => m.function),
-          matchCount: sr.matches.length,
-          totalAvailable: sr.totalAvailable,
-          hint:
-            "Use call_tool with the exact tool name and arguments " +
-            "from the schemas above.",
         },
       };
     } else {

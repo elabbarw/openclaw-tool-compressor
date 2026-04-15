@@ -1,11 +1,14 @@
 /**
  * In-memory tool registry.
  *
- * Built per-request from the full tool definitions available to the agent.
- * Provides keyword search with scoring and compact fallback listing.
+ * Stores tool definitions, precomputed search structures (name tokens,
+ * keyword sets), and execute function references. Provides keyword
+ * search with scoring and a compact fallback listing.
  *
- * Lifecycle: created at request start, garbage collected after response.
- * No persistence, no stale state, no cache invalidation headaches.
+ * Lifecycle: immutable after construction. Owned by a ToolCompressor
+ * instance, which the proxy may cache across requests. Do not add
+ * mutable per-request state — it would silently leak across cached
+ * requests in proxy mode.
  */
 
 import { extractKeywords, expandWithSynonyms } from "./keywords.js";
@@ -44,12 +47,19 @@ export class ToolRegistry {
         : description;
 
     const keywords = extractKeywords(name, description);
+    const nameLower = name.toLowerCase();
+    const nameTokens = new Set(
+      nameLower.replace(/[-_.]/g, " ").split(/\s+/).filter(Boolean)
+    );
 
     this.entries.set(name, {
       name,
+      nameLower,
+      nameTokens,
       summary,
       fullSpec: spec,
       keywords,
+      keywordSet: new Set(keywords),
       execute,
     });
   }
@@ -117,36 +127,27 @@ export class ToolRegistry {
       let score = 0;
 
       // Exact name match (highest signal)
-      if (expanded.has(name.toLowerCase())) {
+      if (expanded.has(entry.nameLower)) {
         score += 10;
       }
 
-      // Tool name token matching
-      const nameTokens = new Set(
-        name
-          .toLowerCase()
-          .replace(/[-_.]/g, " ")
-          .split(/\s+/)
-      );
-
+      // Tool name token matching (precomputed at register time)
       for (const token of expanded) {
-        if (nameTokens.has(token)) {
+        if (entry.nameTokens.has(token)) {
           score += 3;
         }
       }
 
-      // Keyword matching
-      const kwSet = new Set(entry.keywords);
+      // Keyword matching (precomputed at register time)
       for (const token of expanded) {
-        if (kwSet.has(token)) {
+        if (entry.keywordSet.has(token)) {
           score += 2;
         }
       }
 
       // Substring matching on tool name
-      const nameLower = name.toLowerCase();
       for (const token of expanded) {
-        if (token.length > 2 && nameLower.includes(token)) {
+        if (token.length > 2 && entry.nameLower.includes(token)) {
           score += 1;
         }
       }

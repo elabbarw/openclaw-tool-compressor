@@ -26,12 +26,18 @@ export interface ToolDefinition {
 export interface RegistryEntry {
   /** Original tool name */
   name: string;
+  /** Lowercased tool name (cached for case-insensitive matching) */
+  nameLower: string;
+  /** Tokens of the tool name, split on separators (cached for search scoring) */
+  nameTokens: Set<string>;
   /** One-line description (truncated for compact listing) */
   summary: string;
   /** Full OpenAI tool definition (restored on search match) */
   fullSpec: ToolDefinition;
   /** Auto-generated search keywords */
   keywords: string[];
+  /** Keywords as a Set (cached for search scoring) */
+  keywordSet: Set<string>;
   /** Original execute function reference */
   execute: ToolExecuteFn;
 }
