@@ -170,6 +170,10 @@ The proxy binds to `127.0.0.1` by default — it is reachable only from the loca
 
 ## Changelog
 
+### 0.3.1 — bug fix
+
+- **Fix (proxy):** `/v1/models` was forwarded to `{upstream}/v1/models`, producing a double `/v1/v1/...` path with the documented `--upstream http://localhost:1234/v1` convention. LM Studio silently rejected the request. Now forwards to `{upstream}/models`, consistent with `/chat/completions`.
+
 ### 0.3.0 — performance + correctness pass
 
 - **Breaking:** `search_tools` response is now `{ tools }`. The previous `matchCount`, `totalAvailable`, and `hint` fields have been removed (saved ~20 tokens per search response, but library consumers that destructured those fields will silently get `undefined`).

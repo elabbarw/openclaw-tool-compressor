@@ -857,10 +857,13 @@ export function createProxyServer(config: ProxyConfig) {
       return;
     }
 
-    // Models passthrough (with response size limit)
+    // Models passthrough (with response size limit).
+    // Note: `upstream` already includes the /v1 path component (per CLI/README
+    // convention: --upstream http://localhost:1234/v1), so we append /models
+    // not /v1/models — same convention used for /chat/completions above.
     if (req.method === "GET" && req.url === "/v1/models") {
       try {
-        const upstreamRes = await fetch(`${upstream}/v1/models`, {
+        const upstreamRes = await fetch(`${upstream}/models`, {
           headers: authHeaders,
         });
         const data = await upstreamRes.text();
