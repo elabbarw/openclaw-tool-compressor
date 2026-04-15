@@ -170,6 +170,10 @@ The proxy binds to `127.0.0.1` by default — it is reachable only from the loca
 
 ## Changelog
 
+### 0.3.2 — meta-loop context pruning
+
+- **Perf (proxy):** Stale `search_tools` results are now stubbed out of `messages[]` between meta-loop iterations. Each search response carries 2-5K tokens of tool schemas, and prior versions replayed every prior round's results on every upstream call — quadratic prompt growth that could exhaust a 65K context window in 3-4 search rounds. Older results are replaced with `{"tools": []}` — same shape the model already knows how to read. The assistant `tool_call` envelope is left intact so the OpenAI `tool_call_id` pairing stays valid; the model can re-call `search_tools` if it needs the schemas back.
+
 ### 0.3.1 — bug fix
 
 - **Fix (proxy):** `/v1/models` was forwarded to `{upstream}/v1/models`, producing a double `/v1/v1/...` path with the documented `--upstream http://localhost:1234/v1` convention. LM Studio silently rejected the request. Now forwards to `{upstream}/models`, consistent with `/chat/completions`.

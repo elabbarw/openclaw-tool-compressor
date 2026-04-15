@@ -720,6 +720,20 @@ export function createProxyServer(config: ProxyConfig) {
     // non-streaming inside the meta-loop; we re-emit SSE at the very end if
     // the original request had stream: true.
     const wantStream = reqBody.stream === true;
+    // Search results we appended in *previous* loop iterations, by their
+    // index in `messages`. When a new search batch arrives we stub the
+    // older results out so the prompt does not grow quadratically with
+    // iteration count — each search_tools response can be 2-5K tokens of
+    // schemas and replaying every prior round on every upstream call
+    // burns through the context window quickly.
+    //
+    // The stub is just `{tools: []}` — same shape the model sees from a
+    // real search response, minus the schemas. The assistant tool_call
+    // envelope is left intact so the OpenAI tool_call_id pairing remains
+    // valid; the model can re-call search_tools if it needs the schemas
+    // back.
+    const previousSearchResultIdxs: number[] = [];
+    const PRUNED_SEARCH_STUB = JSON.stringify({ tools: [] });
 
     for (let iter = 0; iter < maxIters; iter++) {
       const iterResult = await runUpstreamIteration(
@@ -794,6 +808,25 @@ export function createProxyServer(config: ProxyConfig) {
       // OpenAI tool protocol requires a matching tool result for every
       // tool_call in an assistant message. The model will typically re-emit
       // the real calls on the next turn with search results in context.
+
+      // Before appending this batch, stub out the *previous* batch's tool
+      // results to cap the meta-loop's per-iteration prompt growth. Old
+      // schemas are typically dead weight once the model has moved on; if
+      // it still needs them it can re-search.
+      if (previousSearchResultIdxs.length > 0) {
+        log(
+          `Pruning ${previousSearchResultIdxs.length} stale search result(s) ` +
+            `from prior iteration`
+        );
+        for (const idx of previousSearchResultIdxs) {
+          const msg = messages[idx];
+          if (msg && msg.role === "tool") {
+            messages[idx] = { ...msg, content: PRUNED_SEARCH_STUB };
+          }
+        }
+        previousSearchResultIdxs.length = 0;
+      }
+
       log(`Resolving ${searchCalls.length} search_tools call(s) internally`);
       messages.push({
         role: "assistant",
@@ -811,6 +844,8 @@ export function createProxyServer(config: ProxyConfig) {
           tool_call_id: sc.id,
           content: JSON.stringify(payload),
         });
+        // Track this index so the next iteration can stub it out.
+        previousSearchResultIdxs.push(messages.length - 1);
       }
       // Loop: re-call upstream with search results injected.
     }
