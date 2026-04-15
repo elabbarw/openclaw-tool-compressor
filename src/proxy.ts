@@ -277,31 +277,29 @@ export function createProxyServer(config: ProxyConfig) {
 
   /**
    * Result of a single upstream iteration.
-   * - "piped": content was streamed directly to the caller, nothing more to do.
    * - "buffered": full response assembled — caller decides whether to re-prompt
    *   (meta-tool loop) or emit to the client.
    * - "error": upstream failed.
    */
   type IterationResult =
-    | { kind: "piped" }
     | { kind: "buffered"; response: ChatCompletionResponse }
     | { kind: "error"; status: number; body: string };
 
   /**
-   * Run one upstream iteration.
+   * Run one upstream iteration. Always buffers the full response.
    *
-   * If `wantStream` is false, the upstream call is non-streaming and the full
-   * JSON response is returned as `buffered`.
+   * Why no streaming pipe-through? Some models (e.g. Qwen3.5) emit reasoning
+   * text BEFORE the tool call in the same response. If we piped content to
+   * the caller as it arrived, by the time the tool_call delta showed up we
+   * would have already leaked text that should have been internal to the
+   * meta-loop, and worse, we couldn't rewrite the meta-tool call into the
+   * real tool call. So we always buffer and decide what to emit only after
+   * the full response is in.
    *
-   * If `wantStream` is true, the upstream call is streaming and the SSE is
-   * parsed as it arrives. The first meaningful delta decides the mode:
-   *   - delta contains tool_calls  → buffer the whole response (we need the
-   *     full assembled tool_calls to detect search_tools / rewrite call_tool).
-   *   - delta contains content     → start piping SSE directly to the caller
-   *     (the long code-gen case — keeps the connection alive).
-   *
-   * When content starts piping, any SSE lines already consumed during the
-   * detection phase are flushed to the caller first so no tokens are lost.
+   * Trade-off: callers using `stream: true` no longer get incremental tokens.
+   * To keep the caller's HTTP connection from timing out on long content
+   * responses (e.g. multi-minute code generation), we send periodic SSE
+   * keepalive comments after a short grace period.
    */
   async function runUpstreamIteration(
     body: unknown,
@@ -358,21 +356,13 @@ export function createProxyServer(config: ProxyConfig) {
       return { kind: "error", status: 502, body: "upstream returned no body" };
     }
 
-    // Streaming path — parse SSE on the fly.
+    // SSE buffering path. We parse deltas as they arrive, accumulate into
+    // `assembled`, and return everything at the end.
     const reader = upstreamResp.body.getReader();
     const decoder = new TextDecoder();
     let lineBuf = "";
 
-    // Raw SSE lines held during the detect phase. If we switch to pipe mode
-    // we flush these to the caller before streaming the rest.
-    const heldLines: string[] = [];
-
-    type Mode = "detect" | "pipe" | "buffer";
-    let mode: Mode = "detect";
-    let sseHeadersWritten = false;
-    let doneSeen = false;
-
-    // Running assembly of the full response (used in buffer mode).
+    // Running assembly of the full response.
     const assembled = {
       id: "",
       object: "chat.completion",
@@ -388,8 +378,14 @@ export function createProxyServer(config: ProxyConfig) {
       }>,
     };
 
-    const writeSseHeaders = () => {
-      if (sseHeadersWritten) return;
+    // SSE keepalive: keep the caller's HTTP connection from timing out
+    // while we buffer a long upstream response. Starts after a 5s grace
+    // (so fast tool-call responses don't trigger it) and pings every 10s.
+    // Standard SSE comment lines are silently ignored by spec-compliant
+    // parsers.
+    let sseHeadersWritten = false;
+    const writeSseHeadersOnce = () => {
+      if (sseHeadersWritten || res.headersSent) return;
       sseHeadersWritten = true;
       res.writeHead(200, {
         "Content-Type": "text/event-stream",
@@ -397,11 +393,28 @@ export function createProxyServer(config: ProxyConfig) {
         "Connection": "keep-alive",
       });
     };
-
-    const flushHeldToPipe = () => {
-      writeSseHeaders();
-      for (const l of heldLines) res.write(l + "\n");
-      heldLines.length = 0;
+    let keepaliveTimer: ReturnType<typeof setInterval> | null = null;
+    const keepaliveStart = setTimeout(() => {
+      writeSseHeadersOnce();
+      try {
+        res.write(": keepalive\n\n");
+      } catch {
+        // caller may have disconnected — handled by socket events
+      }
+      keepaliveTimer = setInterval(() => {
+        try {
+          res.write(": keepalive\n\n");
+        } catch {
+          /* ignore */
+        }
+      }, 10_000);
+    }, 5_000);
+    const stopKeepalive = () => {
+      clearTimeout(keepaliveStart);
+      if (keepaliveTimer) {
+        clearInterval(keepaliveTimer);
+        keepaliveTimer = null;
+      }
     };
 
     const mergeDelta = (chunk: Record<string, unknown>): void => {
@@ -446,74 +459,14 @@ export function createProxyServer(config: ProxyConfig) {
 
     const processLine = (rawLine: string): void => {
       const trimmed = rawLine.trimEnd();
-
-      // Blank line = SSE event separator.
-      if (trimmed === "") {
-        if (mode === "pipe") res.write("\n");
-        else heldLines.push(rawLine);
-        return;
-      }
-
-      if (!trimmed.startsWith("data:")) {
-        if (mode === "pipe") res.write(rawLine + "\n");
-        else heldLines.push(rawLine);
-        return;
-      }
-
+      if (trimmed === "" || !trimmed.startsWith("data:")) return;
       const dataStr = trimmed.slice(5).trimStart();
-
-      if (dataStr === "[DONE]") {
-        doneSeen = true;
-        if (mode === "pipe") res.write("data: [DONE]\n\n");
-        return;
-      }
-
-      let chunk: Record<string, unknown>;
+      if (dataStr === "[DONE]") return;
       try {
-        chunk = JSON.parse(dataStr) as Record<string, unknown>;
+        const chunk = JSON.parse(dataStr) as Record<string, unknown>;
+        mergeDelta(chunk);
       } catch {
-        if (mode === "pipe") res.write(rawLine + "\n");
-        else heldLines.push(rawLine);
-        return;
-      }
-
-      mergeDelta(chunk);
-
-      // Decide mode on the first delta that carries content or a tool name.
-      if (mode === "detect") {
-        const firstTcName = assembled.toolCalls[0]?.function.name;
-        if (firstTcName) {
-          mode = "buffer";
-        } else if (assembled.content.length > 0) {
-          mode = "pipe";
-          flushHeldToPipe();
-          res.write(rawLine + "\n");
-          return;
-        }
-      }
-
-      // Defensive: if a meta-tool call appears AFTER we committed to pipe
-      // mode (model emitted content then called search_tools/call_tool in
-      // the same turn), we can't rewrite in-place — we've already streamed
-      // the earlier chunks. Log so this is visible; the caller will see a
-      // tool_call it can't execute and surface its own error.
-      if (mode === "pipe") {
-        const leakedName = assembled.toolCalls[0]?.function.name;
-        if (
-          leakedName === "search_tools" ||
-          leakedName === "call_tool"
-        ) {
-          log(
-            `WARNING: meta-tool "${leakedName}" emitted after content in pipe ` +
-              `mode — cannot rewrite; caller will see it unchanged`
-          );
-        }
-      }
-
-      if (mode === "pipe") {
-        res.write(rawLine + "\n");
-      } else {
-        heldLines.push(rawLine);
+        // Malformed SSE chunk — skip.
       }
     };
 
@@ -532,26 +485,14 @@ export function createProxyServer(config: ProxyConfig) {
       // Flush any trailing partial line.
       if (lineBuf.length > 0) processLine(lineBuf);
     } catch (err) {
+      stopKeepalive();
       const msg = err instanceof Error ? err.message : String(err);
       log(`Upstream read error: ${msg}`);
-      // If we've already started piping to the caller we can't change our
-      // mind — close the SSE stream cleanly so the client sees a terminator
-      // rather than a truncated connection.
-      if ((mode as Mode) === "pipe") {
-        if (!doneSeen) res.write("data: [DONE]\n\n");
-        res.end();
-        return { kind: "piped" };
-      }
       return { kind: "error", status: 502, body: `upstream read error: ${msg}` };
     }
+    stopKeepalive();
 
-    if ((mode as Mode) === "pipe") {
-      if (!doneSeen) res.write("data: [DONE]\n\n");
-      res.end();
-      return { kind: "piped" };
-    }
-
-    // Buffered or undecided (empty response) — assemble a ChatCompletionResponse.
+    // Assemble a ChatCompletionResponse from the merged deltas.
     const message: ChatCompletionResponse["choices"][0]["message"] = {
       role: assembled.role,
       content: assembled.content.length > 0 ? assembled.content : null,
@@ -563,6 +504,25 @@ export function createProxyServer(config: ProxyConfig) {
         function: tc.function,
       }));
     }
+    // Force finish_reason to "tool_calls" when tool_calls are present.
+    // Some upstreams (and reasoning-model variants that emit content before
+    // a tool call) send the final chunk with finish_reason still null, or
+    // forget to override the default "stop". If the proxy then forwards
+    // finish_reason: "stop" alongside tool_calls, the caller sees it as a
+    // final text answer and silently drops the tool_calls. This caused
+    // call_tool wraps to be lost when reasoning models emitted content
+    // first.
+    let finishReason = assembled.finishReason;
+    if (
+      assembled.toolCalls.length > 0 &&
+      finishReason !== "tool_calls"
+    ) {
+      log(
+        `Overriding finish_reason "${finishReason}" -> "tool_calls" ` +
+          `(${assembled.toolCalls.length} tool_call(s) present)`
+      );
+      finishReason = "tool_calls";
+    }
     const full: ChatCompletionResponse = {
       id: assembled.id || `proxy-${Date.now()}`,
       object: "chat.completion",
@@ -572,7 +532,7 @@ export function createProxyServer(config: ProxyConfig) {
         {
           index: 0,
           message,
-          finish_reason: assembled.finishReason,
+          finish_reason: finishReason,
         },
       ],
     };
@@ -593,10 +553,11 @@ export function createProxyServer(config: ProxyConfig) {
    * Emit a final chat completion response to the caller in either plain JSON
    * or SSE (OpenAI streaming) format, depending on what the caller asked for.
    *
-   * The meta-tool loop always runs against a non-streaming upstream because
-   * it needs to inspect complete tool_calls. If the original caller requested
-   * `stream: true`, we re-emit the final assembled response as a single SSE
-   * chunk followed by `[DONE]`.
+   * Upstream is always buffered (see runUpstreamIteration). If the caller
+   * requested `stream: true`, we re-emit the assembled response as a single
+   * SSE chunk followed by `[DONE]`. SSE headers may already have been
+   * written by the keepalive path — `res.headersSent` guards against a
+   * double writeHead.
    */
   function sendFinal(
     res: ServerResponse,
@@ -604,7 +565,9 @@ export function createProxyServer(config: ProxyConfig) {
     wantStream: boolean
   ): void {
     if (!wantStream) {
-      res.writeHead(200, { "Content-Type": "application/json" });
+      if (!res.headersSent) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+      }
       res.end(JSON.stringify(response));
       return;
     }
@@ -621,11 +584,13 @@ export function createProxyServer(config: ProxyConfig) {
         logprobs: null,
       })),
     };
-    res.writeHead(200, {
-      "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache",
-      "Connection": "keep-alive",
-    });
+    if (!res.headersSent) {
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+      });
+    }
     res.write(`data: ${JSON.stringify(chunk)}\n\n`);
     res.end("data: [DONE]\n\n");
   }
@@ -645,7 +610,13 @@ export function createProxyServer(config: ProxyConfig) {
     if (tc.function.name !== "call_tool") return tc;
     const parsed = parseArgs(tc.function.arguments);
     const rawName = String(parsed.tool_name ?? "");
-    if (!rawName) return tc;
+    if (!rawName) {
+      log(
+        `WARNING: call_tool emitted with no tool_name. Args: ` +
+          `${tc.function.arguments?.slice(0, 200) ?? "<empty>"}`
+      );
+      return tc;
+    }
     const realName = compressor.resolveToolName(rawName) ?? rawName;
     if (realName !== rawName) {
       log(`Normalised tool name: ${rawName} -> ${realName}`);
@@ -655,6 +626,7 @@ export function createProxyServer(config: ProxyConfig) {
       typeof rawArgs === "string"
         ? rawArgs
         : JSON.stringify(rawArgs ?? {});
+    log(`Unwrapping call_tool -> ${realName} (${argsStr.length} arg bytes)`);
     return {
       ...tc,
       function: { name: realName, arguments: argsStr },
@@ -741,9 +713,10 @@ export function createProxyServer(config: ProxyConfig) {
           ...reqBody,
           messages,
           tools: compressedTools,
-          // Upstream streams only if the caller wanted streaming. When the
-          // response is a content turn (e.g. long code generation), SSE is
-          // piped directly from upstream to caller without buffering.
+          // Upstream still streams when the caller wanted streaming — the
+          // proxy buffers the SSE for meta-tool inspection, but SSE keepalive
+          // comments are emitted to the caller in the meantime so long
+          // responses don't trip its HTTP timeout.
           stream: wantStream,
         },
         res,
@@ -757,11 +730,6 @@ export function createProxyServer(config: ProxyConfig) {
           });
         }
         res.end(iterResult.body);
-        return;
-      }
-
-      // Content already streamed to the caller. Nothing more to do.
-      if (iterResult.kind === "piped") {
         return;
       }
 

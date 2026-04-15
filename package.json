@@ -1,6 +1,6 @@
 {
   "name": "openclaw-tool-compressor",
-  "version": "0.3.2",
+  "version": "0.3.4",
   "description": "Tool definition compression for OpenAI-compatible LLM APIs. Replaces N tool definitions with 2 meta-tools (search_tools, call_tool) to reduce context window overhead by 70-97%.",
   "type": "module",
   "main": "dist/index.js",

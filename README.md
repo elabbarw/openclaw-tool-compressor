@@ -170,6 +170,16 @@ The proxy binds to `127.0.0.1` by default — it is reachable only from the loca
 
 ## Changelog
 
+### 0.3.4 — fix tool_calls being silently dropped + diagnostic logs
+
+- **Fix (proxy):** When the assembled response contained `tool_calls` but the upstream's final SSE chunk didn't explicitly set `finish_reason: "tool_calls"` (some upstreams leave it null, some reasoning-model variants forget to override the default `"stop"`), the proxy was forwarding `finish_reason: "stop"` alongside the tool_calls. Strict callers treated the response as a final text answer and silently dropped the tool_calls. The proxy now overrides `finish_reason` to `"tool_calls"` whenever assembled tool_calls are present, regardless of what upstream said.
+- **Debug:** `unwrapCallTool` now logs each rewrite (`call_tool -> real_tool_name`) and warns when `call_tool` arrives without a `tool_name`. Helps diagnose model-side malformations under context pressure.
+
+### 0.3.3 — fix meta-tool leak when models emit reasoning before tool calls
+
+- **Fix (proxy):** Models that emit content tokens before a tool call (Qwen3.5 reasoning, some MoE variants) caused the proxy's pipe-mode SSE to commit to streaming the reasoning text to the caller before the meta-tool call arrived. The meta-tool then leaked through unrewritten. Fixed by removing pipe mode entirely from the meta-loop — the upstream SSE is now always buffered before any decision is made about emitting to the caller.
+- **Trade-off:** Callers with `stream: true` no longer receive incremental tokens for content responses. The full response is delivered as a single SSE chunk after upstream completes. To prevent HTTP timeouts on long responses (e.g. multi-minute code generation), SSE keepalive comments are emitted every 10s after a 5s grace.
+
 ### 0.3.2 — meta-loop context pruning
 
 - **Perf (proxy):** Stale `search_tools` results are now stubbed out of `messages[]` between meta-loop iterations. Each search response carries 2-5K tokens of tool schemas, and prior versions replayed every prior round's results on every upstream call — quadratic prompt growth that could exhaust a 65K context window in 3-4 search rounds. Older results are replaced with `{"tools": []}` — same shape the model already knows how to read. The assistant `tool_call` envelope is left intact so the OpenAI `tool_call_id` pairing stays valid; the model can re-call `search_tools` if it needs the schemas back.
