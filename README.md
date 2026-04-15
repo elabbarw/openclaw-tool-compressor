@@ -74,6 +74,8 @@ for (const toolCall of response.tool_calls) {
 
 ## Configuration
 
+Shared options (proxy + library):
+
 ```typescript
 {
   maxResults: 5,           // Max search results returned (default: 5)
@@ -86,7 +88,22 @@ for (const toolCall of response.tool_calls) {
 }
 ```
 
-Works the same in both proxy and library modes.
+### Proxy-only options
+
+| Option | Default | Description |
+|---|---|---|
+| `port` | `8100` | Port to listen on |
+| `host` | `127.0.0.1` | Bind address (see Security below) |
+| `upstreamApiKey` | — | Bearer token forwarded upstream |
+| `maxLoopIterations` | `10` | Max internal search/call iterations before stopping |
+| `minToolCountForCompression` | `8` | Below this tool count, the request is forwarded unchanged. Compression has a fixed cost (~500 tokens of meta-tool overhead + discovery round-trips), so on small tool sets it can be net-negative. |
+| `compressorCacheSize` | `16` | Max cached compressor instances (LRU). For stable tool lists across a conversation, this skips keyword extraction and registry construction on every request. |
+
+The proxy also bypasses compression automatically when:
+
+- The request has no `tools[]`.
+- `tool_choice` pins a specific function name (compression would hide that tool from the model).
+- The tool count is below `minToolCountForCompression`.
 
 ### Passthrough
 
@@ -144,6 +161,22 @@ With library:
 |------|----------|--------------|
 | **Proxy** | Any OpenAI-compatible setup | HTTP proxy between agent and LLM API. No code changes. |
 | **Library** | Custom agent code | Import and use programmatically. Full control. |
+
+## Security
+
+The proxy binds to `127.0.0.1` by default — it is reachable only from the local machine. **It does not authenticate inbound requests.** If you bind to `0.0.0.0` or any non-loopback interface (common in containers and cloud deployments), the proxy is open to anyone on the network and any caller can use your `--api-key` for free upstream LLM calls. Run behind a firewall, reverse proxy, or in a network-isolated environment in those cases.
+
+`--debug` writes search queries, tool names, and partial tool arguments to stdout. Don't enable it in shared or multi-tenant environments where logs may be visible to others.
+
+## Changelog
+
+### 0.3.0 — performance + correctness pass
+
+- **Breaking:** `search_tools` response is now `{ tools }`. The previous `matchCount`, `totalAvailable`, and `hint` fields have been removed (saved ~20 tokens per search response, but library consumers that destructured those fields will silently get `undefined`).
+- **New (proxy):** `minToolCountForCompression` (default `8`) — bypass compression on small tool sets.
+- **New (proxy):** `compressorCacheSize` (default `16`) — LRU cache of compressor instances, keyed by tools[] + compression config. Removes per-request keyword extraction and registry construction when tool list is stable.
+- **New (proxy):** Specific `tool_choice` (`{function:{name:"X"}}`) now bypasses compression — fixes a latent bug where compression would hide the pinned tool from the LLM.
+- **Perf:** Precomputed name tokens / keyword sets on every registry entry — search no longer allocates Sets per entry per query.
 
 ## License
 

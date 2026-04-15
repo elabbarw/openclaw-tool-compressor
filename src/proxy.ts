@@ -14,7 +14,8 @@
  *   Agent <- Proxy (handle meta-tools internally) <- LLM API
  */
 
-import { createServer, type IncomingMessage, type ServerResponse } from "http";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { createHash } from "node:crypto";
 import { ToolCompressor, type ToolEntry } from "./compressor.js";
 import type { ToolDefinition, ToolCompressorConfig } from "./types.js";
 
@@ -29,6 +30,106 @@ export interface ProxyConfig extends ToolCompressorConfig {
   upstreamApiKey?: string;
   /** Max internal search/call loop iterations to prevent runaway (default: 10) */
   maxLoopIterations?: number;
+  /**
+   * Minimum tool count to enable compression (default: 8).
+   *
+   * Below this threshold, the proxy forwards the original tools[] unchanged.
+   * Compression has a fixed cost (~500 tokens of meta-tool overhead plus
+   * potential discovery round-trips), so on small tool sets it can be
+   * net negative.
+   */
+  minToolCountForCompression?: number;
+  /**
+   * Max number of compressor instances to cache (default: 16).
+   *
+   * The compressor is keyed on a stable hash of `tools[]` plus the
+   * compression-relevant config (synonyms, passthrough, maxResults,
+   * minScore). For stable tool lists across a conversation, this skips
+   * keyword extraction and registry construction on every request.
+   */
+  compressorCacheSize?: number;
+}
+
+/**
+ * Tiny LRU built on the native Map (which preserves insertion order).
+ * Sized small and bounded — intended for caching compressor instances
+ * across requests that share the same tools[] payload.
+ */
+class LruCache<K, V> {
+  private map = new Map<K, V>();
+  constructor(private readonly max: number) {}
+  get(key: K): V | undefined {
+    const v = this.map.get(key);
+    if (v === undefined) return undefined;
+    // Refresh recency: delete + re-insert to move to tail.
+    this.map.delete(key);
+    this.map.set(key, v);
+    return v;
+  }
+  set(key: K, value: V): void {
+    if (this.map.has(key)) {
+      this.map.delete(key);
+    } else if (this.map.size >= this.max) {
+      const oldest = this.map.keys().next().value as K | undefined;
+      if (oldest !== undefined) this.map.delete(oldest);
+    }
+    this.map.set(key, value);
+  }
+}
+
+/**
+ * Build a stable cache key for a compressor instance.
+ *
+ * We hash the normalised tool specs (sorted by name so insertion order
+ * doesn't matter) together with the compression-relevant config. Anything
+ * that changes how the registry behaves — synonyms, passthrough list,
+ * scoring thresholds — must be part of the key; purely operational config
+ * (upstream URL, debug, port) is not.
+ */
+function compressorCacheKey(
+  tools: ToolDefinition[],
+  config: ProxyConfig
+): string {
+  // SHA-1 is used here as a fast content-addressable fingerprint, not for
+  // any cryptographic property. Collisions degrade to a cache miss, which
+  // is harmless.
+  const h = createHash("sha1");
+  // Normalise tool specs to a stable canonical form.
+  const specs = tools
+    .map((t) => ({
+      n: t.function.name,
+      d: t.function.description ?? "",
+      p: t.function.parameters ?? {},
+    }))
+    .sort((a, b) => (a.n < b.n ? -1 : a.n > b.n ? 1 : 0));
+  // JSON.stringify can throw on adversarial input — circular refs introduced
+  // by post-parse mutation, BigInt values, or rogue toJSON methods. Tools
+  // come from the HTTP request body, which we don't control. Fall back to
+  // a name-only key in that case so the request still gets a stable hash
+  // (and stays out of the LRU rather than wedging the request with a 500).
+  try {
+    h.update(JSON.stringify(specs));
+  } catch {
+    h.update(specs.map((s) => s.n).join("\u0000"));
+  }
+  h.update("||");
+  try {
+    h.update(
+      JSON.stringify({
+        maxResults: config.maxResults ?? null,
+        minScore: config.minScore ?? null,
+        synonyms: config.synonyms ?? null,
+        passthrough: config.passthrough
+          ? [...config.passthrough].sort()
+          : null,
+      })
+    );
+  } catch {
+    // Config is in-process; this should be unreachable. Empty marker on
+    // the off chance someone stuffs a non-serialisable value in synonyms.
+    h.update("config-unserialisable");
+  }
+  return h.digest("hex");
 }
 
 interface ChatCompletionRequest {
@@ -85,12 +186,58 @@ export function createProxyServer(config: ProxyConfig) {
   const authHeaders: Record<string, string> = config.upstreamApiKey
     ? { "Authorization": `Bearer ${config.upstreamApiKey}` }
     : {};
+  const minToolsForCompression = config.minToolCountForCompression ?? 8;
+  const compressorCache = new LruCache<string, ToolCompressor>(
+    config.compressorCacheSize ?? 16
+  );
 
   const log = (msg: string) => {
     if (config.debug) {
       console.log(`[proxy] ${msg}`);
     }
   };
+
+  /**
+   * Get (or build + cache) a ToolCompressor for the given tool list.
+   * Execute stubs throw — the proxy never executes tools, only rewrites calls.
+   */
+  function getCompressor(tools: ToolDefinition[]): ToolCompressor {
+    const key = compressorCacheKey(tools, config);
+    const cached = compressorCache.get(key);
+    if (cached) {
+      log(`compressor cache HIT (${tools.length} tools)`);
+      return cached;
+    }
+    log(`compressor cache MISS (${tools.length} tools)`);
+    const entries: ToolEntry[] = tools.map((spec) => ({
+      spec,
+      execute: async () => {
+        throw new Error("proxy does not execute tools; caller does");
+      },
+    }));
+    const compressor = new ToolCompressor(entries, config);
+    compressorCache.set(key, compressor);
+    return compressor;
+  }
+
+  /**
+   * Inspect `tool_choice` to see if the caller is forcing a specific tool.
+   *
+   * OpenAI's tool_choice can be:
+   *   - "auto" / undefined / "required"  → model picks; compression is safe.
+   *   - "none"                           → no tools used at all.
+   *   - { type:"function", function:{ name:"X" } } → model must call X.
+   *
+   * If the caller pinned a specific function name, compression would hide
+   * that tool from the model and the pinned choice would reference a name
+   * the LLM doesn't have — better to pass the request through untouched.
+   */
+  function hasSpecificToolChoice(choice: unknown): boolean {
+    if (!choice || typeof choice !== "object") return false;
+    const obj = choice as Record<string, unknown>;
+    const fn = obj.function as Record<string, unknown> | undefined;
+    return typeof fn?.name === "string" && fn.name.length > 0;
+  }
 
   /**
    * Forward a request to the upstream LLM API and pipe the response body
@@ -537,15 +684,28 @@ export function createProxyServer(config: ProxyConfig) {
       return;
     }
 
-    // Build compressor. The execute stubs are never invoked here — we only
-    // use the compressor for its search_tools logic and registry lookups.
-    const toolEntries: ToolEntry[] = originalTools.map((spec) => ({
-      spec,
-      execute: async () => {
-        throw new Error("proxy does not execute tools; caller does");
-      },
-    }));
-    const compressor = new ToolCompressor(toolEntries, config);
+    // Caller pinned a specific tool (tool_choice.function.name=X). Compression
+    // would hide that tool from the LLM. Bypass and pass through unchanged.
+    if (hasSpecificToolChoice(reqBody.tool_choice)) {
+      log("tool_choice pins a specific function, bypassing compression");
+      await forwardAndPipe("/chat/completions", reqBody, res);
+      return;
+    }
+
+    // Too few tools to benefit from compression. The fixed cost of the
+    // meta-tool overhead + discovery round-trips outweighs the prompt
+    // savings below this threshold.
+    if (originalTools.length < minToolsForCompression) {
+      log(
+        `${originalTools.length} tools < minToolCountForCompression=` +
+          `${minToolsForCompression}, bypassing compression`
+      );
+      await forwardAndPipe("/chat/completions", reqBody, res);
+      return;
+    }
+
+    // Reuse cached compressor when tools[] and compression config match.
+    const compressor = getCompressor(originalTools);
     const stats = compressor.getStats();
     log(
       `Compressing ${stats.originalToolCount} tools -> ` +
